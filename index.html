@@ -622,6 +622,269 @@ const SF='https://api.scryfall.com';
 const EDHREC_BASE='https://json.edhrec.com';
 const RANK_LIMITS={1:9000,2:6000,3:3500,4:1800,5:800};
 
+// ─── IDENTIDAD DE COLOR ────────────────────────────────────────────────
+// Devuelve el clause de Scryfall para la identidad de color del comandante.
+// CLAVE: usa id<= (identidad de color = legalidad real en Commander), NO color<=.
+// Comandante INCOLORO (identidad vacía) → SOLO cartas incoloras (id:colorless).
+// Antes esto caía a 'WUBRG' y dejaba pasar criaturas de cualquier color (bug Tríada Capitolina).
+function ciClause(){
+  const ci = S._ci || [];
+  return ci.length ? `id<=${ci.join('')}` : 'id:colorless';
+}
+// Colores para tierras básicas. Incoloro → ['C'] (Yermos/Wastes).
+function basicCols(){
+  const ci = S._ci || [];
+  return ci.length ? ci.slice() : ['C'];
+}
+// Nombre de la tierra básica por color.
+const BASIC_NAME = {W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest',C:'Wastes'};
+
+// ─── DETECCIÓN DE ARQUETIPO/TEMA ───────────────────────────────────────
+// Lee el oráculo del comandante + sus partners + las estrategias elegidas y
+// devuelve los temas mecánicos del mazo (no solo del comandante). Cada tema
+// añade queries dirigidas y un bonus de puntuación para que el mazo entienda
+// QUÉ cartas acompañan al comandante (artefactos, históricas, cementerio...).
+function detectThemes(){
+  const cmd = S.cmdData, partner = S.partnerData;
+  if(!cmd) return [];
+  const txt = (
+    (cmd.oracle_text||'') + ' ' + (cmd.type_line||'') + ' ' +
+    (cmd.card_faces||[]).map(f=>(f.oracle_text||'')+' '+(f.type_line||'')).join(' ') + ' ' +
+    (partner ? (partner.oracle_text||'')+' '+(partner.type_line||'')+' '+(partner.card_faces||[]).map(f=>(f.oracle_text||'')+' '+(f.type_line||'')).join(' ') : '')
+  ).toLowerCase();
+  const has = (...ks) => ks.some(k => txt.includes(k));
+  const themes = new Set();
+
+  if(has('artifact','equipment','metalcraft','affinity','improvise')) themes.add('artifacts');
+  if(has('historic','legendary','saga')) themes.add('historic');
+  if(has('graveyard','dies','mill','exile from your graveyard','from your graveyard','flashback','dredge','unearth')) themes.add('graveyard');
+  if(has('+1/+1 counter','proliferate','counter on','counters on')) themes.add('counters');
+  if(has('create','token','populate','convoke','amass')) themes.add('tokens');
+  if(has('sacrifice','whenever a creature dies','whenever you sacrifice')) themes.add('sacrifice');
+  if(has('instant','sorcery','magecraft','prowess','whenever you cast','noncreature spell')) themes.add('spells');
+  if(has('enchantment','aura','enchant','constellation')) themes.add('enchantments');
+  if(has('lifelink','gain life','you gain','whenever you gain life')) themes.add('lifegain');
+  if(has('equip','equipped creature','attach','aura','enchant creature')) themes.add('voltron');
+  if(has('landfall','search your library for a land','additional land','play a land')) themes.add('lands');
+  if(has('draw','whenever you draw')) themes.add('draw');
+
+  // Las estrategias elegidas también son temas explícitos del mazo
+  const stratThemeMap = {
+    artifacts:'artifacts', voltron:'voltron', legendary:'historic', tokens:'tokens',
+    counters:'counters', sacrifice:'sacrifice', aristocrats:'sacrifice', spells:'spells',
+    copy:'spells', enchantress:'enchantments', lifegain:'lifegain', lifedrain:'lifegain',
+    reanimate:'graveyard', graveyard:'graveyard', mill:'graveyard', lands:'lands', ramp:'lands', draw:'draw'
+  };
+  (S.strategies||[]).forEach(id => { if(stratThemeMap[id]) themes.add(stratThemeMap[id]); });
+
+  return [...themes];
+}
+
+// Para una sección concreta, devuelve queries Scryfall extra según los temas.
+// {ci} es el clause de identidad ya resuelto (ciClause()).
+function themeQueries(sid, ci){
+  const themes = detectThemes();
+  const q = [];
+  const add = (...arr) => arr.forEach(x => q.push(`${x} ${ci} legal:commander -is:extra -is:funny`));
+  for(const th of themes){
+    if(sid==='creatures'){
+      if(th==='artifacts')  add('t:creature t:artifact', 't:creature (o:"artifact" o:"whenever")');
+      if(th==='historic')   add('t:creature t:legendary', 't:creature (o:"legendary" OR o:"historic")');
+      if(th==='graveyard')  add('t:creature (o:"from your graveyard" OR o:"when this creature dies" OR o:"whenever a creature dies" OR o:"mill")');
+      if(th==='counters')   add('t:creature (o:"+1/+1 counter" OR o:"proliferate")');
+      if(th==='tokens')     add('t:creature (o:"create" o:"token")');
+      if(th==='sacrifice')  add('t:creature (o:"sacrifice" OR o:"dies")');
+      if(th==='spells')     add('t:creature (o:"magecraft" OR o:"prowess" OR o:"whenever you cast")');
+      if(th==='lifegain')   add('t:creature (o:lifelink OR o:"whenever you gain life")');
+      if(th==='voltron')    add('t:creature (o:"hexproof" OR o:"double strike" OR o:"can\'t be blocked")');
+    } else if(sid==='artifacts'){
+      if(th==='artifacts')  add('t:artifact -t:creature', 't:artifact t:creature');
+      if(th==='historic')   add('t:artifact t:legendary');
+      if(th==='voltron')    add('t:equipment');
+      if(th==='counters')   add('t:artifact (o:"+1/+1 counter" OR o:"proliferate")');
+    } else if(sid==='enchants'){
+      if(th==='enchantments') add('t:enchantment -t:artifact', 't:enchantment t:aura');
+      if(th==='historic')     add('t:enchantment t:saga');
+      if(th==='counters')     add('t:enchantment (o:"+1/+1 counter" OR o:"proliferate")');
+      if(th==='lifegain')     add('t:enchantment (o:lifelink OR o:"gain life")');
+    } else if(sid==='spells'){
+      if(th==='spells')     add('(t:instant OR t:sorcery) (o:"copy" OR o:"magecraft" OR o:"draw")');
+      if(th==='graveyard')  add('(t:instant OR t:sorcery) (o:"from your graveyard" OR o:"mill" OR o:"return target")');
+      if(th==='counters')   add('(t:instant OR t:sorcery) (o:"+1/+1 counter" OR o:"proliferate")');
+    }
+  }
+  return q;
+}
+
+// ═══════════════════════════════════════════════════════════
+// MOTOR DE SCORING — CONTEXTO MAESTRO cEDH
+// Aplica los 4 Pilares al scoring de cada carta durante el build.
+// Devuelve un bonus (puede ser negativo para penalizar [TRAP]).
+// ═══════════════════════════════════════════════════════════
+function themeBonus(card, themes){
+  if(!themes) return 0;
+  const tl = (card.type_line||'').toLowerCase();
+  const tx = ((card.oracle_text||'') + ' ' +
+              (card.card_faces||[]).map(f=>f.oracle_text||'').join(' ')).toLowerCase();
+  const cmc = card.cmc || 0;
+  const br  = S.bracket || 3;
+  let b = 0;
+
+  // ── PILAR 1 — Sinergia real vs. Carta Trampa ──────────────────────
+  // ENGINE: genera cartas, maná o tutoriza de forma recurrente → bonus fuerte
+  const isEngine =
+    (tx.includes('draw') && tx.includes('whenever')) ||
+    (tx.includes('add') && tx.includes('mana') && tx.includes('whenever')) ||
+    tx.includes('search your library') ||
+    tx.includes('at the beginning of your upkeep') && tx.includes('draw') ||
+    tx.includes('whenever you cast') && tx.includes('draw') ||
+    tx.includes('proliferate');
+  if(isEngine) b += 6;
+
+  // ENABLER: acelera el turno crítico (fast mana, cost reduction, haste enabler)
+  const isEnabler =
+    (cmc <= 2 && tx.includes('add') && (tx.includes('{') || tx.includes('mana'))) ||
+    (cmc === 0 && tl.includes('artifact')) ||
+    tx.includes('cost') && tx.includes('less') ||
+    tx.includes('haste') && tl.includes('creature') && cmc <= 3;
+  if(isEnabler) b += 4;
+
+  // PAYOFF: convierte el estado de ventaja en victoria (win-con o cierre)
+  const isPayoff =
+    tx.includes('win the game') ||
+    tx.includes('loses the game') ||
+    (tx.includes('deal') && tx.includes('damage') && tx.includes('each opponent')) ||
+    tx.includes('infinite') ||
+    (tx.includes('whenever') && tx.includes('counter') && tx.includes('spell')) ||
+    tx.includes('storm') ||
+    tx.includes('untap') && tx.includes('add') && cmc <= 4;
+  if(isPayoff) b += 5;
+
+  // INTERACTION: counters, remoción con buen timing, hate pieces relevantes
+  const isInteraction =
+    (tx.includes('counter target') && cmc <= 3) ||
+    (tx.includes('destroy target') && cmc <= 3) ||
+    (tx.includes('exile target') && cmc <= 3) ||
+    (tx.includes('return target') && cmc <= 2) ||
+    tx.includes('stifle') || tx.includes('flash') && tl.includes('creature') && tx.includes('counter');
+  if(isInteraction) b += 3;
+
+  // TRAP — penalizaciones activas por fallos estructurales:
+
+  // Pilar 2: CMC prohibitivo para el Turno Crítico del bracket
+  // Bracket 1-2 → penalizar CMC≥6; Bracket 3 → CMC≥7; Bracket 4-5 → CMC≥5 sin payoff
+  const cmcThreshold = br <= 2 ? 6 : br === 3 ? 7 : 5;
+  if(cmc >= cmcThreshold && !isPayoff && !isEngine) b -= 8;
+  else if(cmc >= cmcThreshold - 1 && !isPayoff && !isEngine) b -= 3;
+
+  // Table Dependency: efecto que depende de que otros jugadores tengan permanentes
+  const isTableDep =
+    tx.includes('for each opponent') && !tx.includes('draw') ||
+    tx.includes('target opponent') && tx.includes('has') ||
+    (tx.includes('number of') && (tx.includes('creatures your opponents control') || tx.includes('permanents your opponents')));
+  if(isTableDep) b -= 4;
+
+  // Do-Nothing Permanent: entra sin impacto y necesita varios turnos para rendir
+  const isDoNothing =
+    !tx.includes('when') && !tx.includes('whenever') && !tx.includes('at the beginning') &&
+    !tx.includes('tap') && !tx.includes('add') && !tx.includes('draw') &&
+    tl.includes('enchantment') && !tl.includes('aura') && cmc >= 4;
+  if(isDoNothing) b -= 5;
+
+  // Velocidad incorrecta: conjuro donde se necesita instantáneo en brackets altos
+  const isSorcerySpeed = tl.includes('sorcery') && !tl.includes('instant');
+  if(isSorcerySpeed && isInteraction && br >= 4) b -= 3;
+
+  // ── PILAR 1 — Sinergia con los temas del mazo ─────────────────────
+  if(!themes.length) return b;
+  for(const th of themes){
+    if(th==='artifacts'){
+      if(tl.includes('artifact'))                                        b += 5;
+      if(tx.includes('artifact') && tx.includes('whenever'))            b += 4;
+      if(tx.includes('affinity') || tx.includes('metalcraft') || tx.includes('improvise')) b += 5;
+    }
+    if(th==='historic'){
+      if(tl.includes('legendary') || tl.includes('saga'))               b += 4;
+      if(tx.includes('historic') || tx.includes('legendary permanent'))  b += 3;
+    }
+    if(th==='graveyard'){
+      if(tx.includes('from your graveyard'))                             b += 5;
+      if(tx.includes('dies') && tx.includes('whenever'))                 b += 4;
+      if(tx.includes('flashback') || tx.includes('unearth') || tx.includes('dredge')) b += 5;
+      if(tx.includes('mill'))                                            b += 3;
+    }
+    if(th==='counters'){
+      if(tx.includes('+1/+1 counter'))                                   b += 5;
+      if(tx.includes('proliferate'))                                     b += 6;
+      if(tx.includes('counter on') && tx.includes('whenever'))          b += 4;
+    }
+    if(th==='tokens'){
+      if(tx.includes('create') && tx.includes('token'))                  b += 5;
+      if(tx.includes('token') && tx.includes('whenever'))                b += 4;
+      if(tx.includes('populate'))                                        b += 4;
+    }
+    if(th==='sacrifice'){
+      if(tx.includes('sacrifice') && tx.includes('whenever'))            b += 5;
+      if(tx.includes('when') && tx.includes('dies'))                     b += 4;
+      if(tx.includes('sacrifice') && tx.includes('draw'))                b += 5; // Skullclamp pattern
+    }
+    if(th==='spells'){
+      if(tx.includes('magecraft'))                                       b += 6;
+      if(tx.includes('prowess'))                                         b += 4;
+      if(tx.includes('whenever you cast') && tl.includes('creature'))   b += 5;
+      if(tx.includes('copy') && (tl.includes('instant') || tl.includes('sorcery'))) b += 5;
+    }
+    if(th==='enchantments'){
+      if(tl.includes('enchantment'))                                     b += 4;
+      if(tx.includes('enchantment') && tx.includes('whenever'))         b += 5;
+      if(tx.includes('constellation'))                                   b += 6;
+    }
+    if(th==='lifegain'){
+      if(tx.includes('lifelink'))                                        b += 3;
+      if(tx.includes('whenever you gain life'))                          b += 5;
+      if(tx.includes('drain life') || (tx.includes('lose life') && tx.includes('you gain life'))) b += 5;
+    }
+    if(th==='voltron'){
+      if(tl.includes('equipment'))                                       b += 6;
+      if(tx.includes('equipped creature'))                               b += 5;
+      if(tx.includes('double strike') || tx.includes('hexproof') || tx.includes('indestructible')) b += 4;
+      if(tx.includes('aura') && tl.includes('enchantment'))             b += 4;
+    }
+    if(th==='lands'){
+      if(tx.includes('landfall'))                                        b += 6;
+      if(tx.includes('search your library') && tx.includes('land'))     b += 5;
+      if(tx.includes('additional land') || tx.includes('play a land'))  b += 5;
+    }
+    if(th==='draw'){
+      if(tx.includes('draw') && tx.includes('whenever'))                 b += 4;
+      if(tx.includes('draw') && cmc <= 3)                               b += 2;
+    }
+  }
+
+  // ── PILAR 2 — Calibración por Turno Crítico y Bracket ─────────────
+  // En brackets altos (4-5) bonificar cartas de bajo CMC que aceleran el turno crítico
+  if(br >= 4){
+    if(cmc <= 1 && (isEngine || isEnabler))  b += 6;
+    if(cmc <= 2 && isInteraction)             b += 4;
+    if(cmc <= 2 && isEngine)                  b += 4;
+  } else if(br >= 3){
+    if(cmc <= 2 && (isEngine || isEnabler))   b += 3;
+  }
+
+  // En brackets bajos (1-2) no penalizar CMC alto tanto
+  if(br <= 2 && cmc >= 5 && isPayoff) b += 3; // big threats son válidos en casual
+
+  // ── PILAR 4 — Redundancia: evitar piezas únicas sin backup ────────
+  // Si la carta activa un loop o una win-con, bonificar extra para asegurar densidad
+  const isComboEnablerPattern =
+    tx.includes('untap') && (tx.includes('add') || tl.includes('creature') && cmc <= 3) ||
+    tx.includes('laboratory maniac') || tx.includes('thassa\'s oracle') ||
+    tx.includes('infinite') && tx.includes('mana');
+  if(isComboEnablerPattern && br >= 3) b += 5;
+
+  return b;
+}
+
 const STRATEGIES=[
   // ── Clásicas ──────────────────────────────────────────────────────────
   {id:'tokens', name:'Tokens', icon:'🪖',
@@ -1021,7 +1284,7 @@ let S={
   budget:null, // presupuesto máximo en € (solo modo auto, null = sin límite)
   wk:{lands:[],ramp:[],creatures:[],spells:[],artifacts:[],enchants:[]},
   pools:{},landCount:36,activeSec:'essentials',deck:null,
-  basicCounts:{W:0,U:0,B:0,R:0,G:0}
+  basicCounts:{W:0,U:0,B:0,R:0,G:0,C:0}
 };
 let zTimer=null,zCache={};
 
@@ -1654,7 +1917,14 @@ function renderStrategySuggestions(){
       burn:['deals damage','each opponent takes','whenever deals combat damage'],
       proliferate:['proliferate','add a counter of each type'],
     }[s.id] || [];
-    const sc = keys.reduce((a, k) => oracle.includes(k) ? a + 2 : a, 0);
+    const sc0 = keys.reduce((a, k) => oracle.includes(k) ? a + 2 : a, 0);
+    let sc = sc0;
+    // Partners = 2+ legendarias sinérgicas → Legendary Matters y Voltron son relevantes
+    // aunque no lo digan en el texto (lo son por TIPO, no por oráculo).
+    if(partner){
+      if(s.id === 'legendary') sc += 4;
+      if(s.id === 'voltron')   sc += 2;
+    }
     return { s, sc };
   }).filter(x => x.sc >= 2).sort((a,b) => b.sc - a.sc).slice(0,4);
 
@@ -1923,11 +2193,11 @@ async function startWorkshop(){
   const cmd=S.cmdData; const partner=S.partnerData;
   const ci1=cmd?.color_identity||[]; const ci2=partner?.color_identity||[];
   S._ci=[...new Set([...ci1,...ci2])];
-  S._cf=`color<=${S._ci.length?S._ci.join(''):'WUBRG'} legal:commander -is:extra -is:funny`;
+  S._cf=`${ciClause()} legal:commander -is:extra -is:funny`;
   // Reset workshop
   S.wk={lands:[],ramp:[],creatures:[],spells:[],artifacts:[],enchants:[]};
   S.pools={}; S.landCount=36; S.activeSec='essentials';
-  S.basicCounts={W:0,U:0,B:0,R:0,G:0};
+  S.basicCounts={W:0,U:0,B:0,R:0,G:0,C:0};
   S._essentialsDone=false;
   _wkEssCache = null;
   _wkEssImgs  = {};
@@ -2301,15 +2571,16 @@ const BASIC_IMGS={
   U:'https://cards.scryfall.io/normal/front/4/d/4d8edc59-ab9c-4f74-aafd-90c3a5c9b46e.jpg',
   B:'https://cards.scryfall.io/normal/front/6/1/619b2d83-0e83-4f7b-8fa4-9a8a4fa3c4b8.jpg',
   R:'https://cards.scryfall.io/normal/front/b/a/bad5dab5-7e43-4c28-9a33-66b34f8a4fd9.jpg',
-  G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg'
+  G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg',
+  C:'https://api.scryfall.com/cards/named?exact=Wastes&version=normal&format=image'
 };
-const BASIC_NAMES={W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest'};
-const BASIC_PIPS={W:'#f4f0e0',U:'#1a6eb5',B:'#2a1a0a',R:'#d4302a',G:'#1a7a42'};
+const BASIC_NAMES={W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest',C:'Yermos'};
+const BASIC_PIPS={W:'#f4f0e0',U:'#1a6eb5',B:'#2a1a0a',R:'#d4302a',G:'#1a7a42',C:'#9aa0aa'};
 
 function renderLands(right,sec,pk,tgt){
   const ci=S._ci||[];
-  // Sólo mostrar básicas de los colores de identidad del comandante
-  const activeCols=ci.length?ci:['W','U','B','R','G'];
+  // Sólo mostrar básicas de la identidad del comandante (incoloro → Yermos)
+  const activeCols=ci.length?ci:['C'];
 
   right.innerHTML=`
     <div class="wk-title"><span>${sec.icon}</span>Tierras</div>
@@ -2424,56 +2695,127 @@ async function loadPool(sid){
   if(S.activeSec===sid) renderCands(sid);
 }
 
-// Calcula puntuación de sinergia de una carta con la estrategia y el comandante
+// Calcula puntuación de sinergia — aplica los 4 Pilares del Contexto Maestro
+// Usado por fetchPool (workshop manual) para ordenar candidatas por calidad real.
 function synergyScore(card, stratId, cmdOracleText){
-  const txt = ((card.oracle_text||'')+(card.card_faces||[]).map(f=>f.oracle_text||'').join(' ')).toLowerCase();
-  const cmdTxt = (cmdOracleText||'').toLowerCase();
-  const typeLine = (card.type_line||'').toLowerCase();
+  const tx  = ((card.oracle_text||'')+(card.card_faces||[]).map(f=>f.oracle_text||'').join(' ')).toLowerCase();
+  const tl  = (card.type_line||'').toLowerCase();
+  const cmc = card.cmc || 0;
+  const br  = S.bracket || 3;
   let sc = 0;
 
-  // Bonus por rank EDHREC global (más popular = más probado)
+  // ── Base: rank EDHREC global (popularidad = calidad probada) ──────
   const rank = card.edhrec_rank || 9999;
   sc += Math.max(0, 3000 - rank) / 300; // hasta +10
 
-  // Keywords por estrategia
-  const stratKeys = {
-    tokens:    ['token','create','populate','convoke','anthem','+1/+1 counter','go wide','create a'],
-    ramp:      ['add','mana','search your library for','land','ramp','landfall','treasure'],
-    control:   ['counter target','draw','flash','return target','destroy all','exile all','scry'],
-    combo:     ['untap','infinite','whenever','each time','tap','add','copy','storm'],
-    aggro:     ['haste','double strike','trample','first strike','menace','vigilance','attack','whenever attacks'],
-    voltron:   ['equipment','equip','attach','equipped creature','aura','enchant creature','double strike','indestructible','protection from','shroud','hexproof','living weapon'],
-    legendary: ['legendary','whenever a legendary','legendary creature','legendary artifact','historic','each time a legendary','hero'],
-    reanimate: ['graveyard','dies','sacrifice','unearth','undying','reanimate','return from your graveyard','mill'],
-    stax:      ["players can't",'opponents can','each player','spells cost','more to cast','enters the battlefield tapped'],
-    spells:    ['magecraft','whenever you cast','instant or sorcery','prowess','copy','storm','cantrip'],
-    artifacts: ['artifact enters','whenever an artifact','metalcraft','affinity','improvise','artifact creature','artifact token'],
-  }[stratId] || [];
-  stratKeys.forEach(kw => { if(txt.includes(kw) || typeLine.includes(kw)) sc += 3; });
+  // ── Pilar 1 — Clasificación funcional [ENGINE/ENABLER/PAYOFF/INTERACTION/TRAP] ──
 
-  // Para estrategia legendaria: bonus extra a cartas legendarias
-  if(stratId === 'legendary' || stratId === 'voltron'){
-    if(typeLine.includes('legendary')) sc += 5;
-    if(typeLine.includes('equipment')) sc += 4;
-    if(txt.includes('equip') || txt.includes('attach')) sc += 3;
-    if(txt.includes('indestructible') || txt.includes('hexproof') || txt.includes('shroud')) sc += 2;
+  // ENGINE: genera cartas, maná o tutoriza de forma recurrente
+  const isEngine =
+    (tx.includes('draw') && tx.includes('whenever')) ||
+    (tx.includes('add') && tx.includes('whenever') && tx.includes('mana')) ||
+    tx.includes('search your library') ||
+    (tx.includes('at the beginning of your upkeep') && tx.includes('draw')) ||
+    tx.includes('proliferate');
+  if(isEngine) sc += 7;
+
+  // ENABLER: fast mana, reducción de coste, haste
+  const isEnabler =
+    (cmc <= 2 && tx.includes('add') && (tx.includes('{') || tx.includes('mana'))) ||
+    (cmc === 0 && tl.includes('artifact')) ||
+    (tx.includes('cost') && tx.includes('less')) ||
+    (tx.includes('haste') && tl.includes('creature') && cmc <= 3);
+  if(isEnabler) sc += 5;
+
+  // PAYOFF: convierte ventaja en victoria
+  const isPayoff =
+    tx.includes('win the game') || tx.includes('loses the game') ||
+    (tx.includes('deal') && tx.includes('damage') && tx.includes('each opponent')) ||
+    tx.includes('storm') || tx.includes('infinite') ||
+    (tx.includes('untap') && tx.includes('add') && cmc <= 4);
+  if(isPayoff) sc += 6;
+
+  // INTERACTION: respuesta eficiente (bajo CMC = mejor en cEDH)
+  const isInteraction =
+    (tx.includes('counter target') && cmc <= 3) ||
+    (tx.includes('destroy target') && cmc <= 3) ||
+    (tx.includes('exile target') && cmc <= 3) ||
+    (tx.includes('destroy all') && cmc <= 5) ||
+    (tx.includes('exile all') && cmc <= 5);
+  if(isInteraction) sc += 4;
+
+  // TRAP — penalizaciones activas ──────────────────────────────────────
+  // CMC prohibitivo para el turno crítico del bracket elegido
+  const cmcThreshold = br <= 2 ? 6 : br === 3 ? 7 : 5;
+  if(cmc >= cmcThreshold && !isPayoff && !isEngine) sc -= 8;
+  else if(cmc >= cmcThreshold - 1 && !isPayoff && !isEngine) sc -= 3;
+
+  // Table Dependency
+  if(tx.includes('for each opponent') && !tx.includes('draw')) sc -= 4;
+  if(tx.includes('number of creatures your opponents control')) sc -= 4;
+
+  // Do-Nothing Permanent (enchantment sin trigger)
+  if(!tx.includes('when') && !tx.includes('whenever') && !tx.includes('at the beginning') &&
+     tl.includes('enchantment') && !tl.includes('aura') && cmc >= 4) sc -= 5;
+
+  // Velocidad incorrecta: remoción a velocidad de conjuro en brackets altos
+  if(tl.includes('sorcery') && isInteraction && br >= 4) sc -= 3;
+
+  // ── Pilar 1 — Sinergia con la estrategia del mazo ─────────────────
+  const stratKeys = {
+    tokens:      ['token','create','populate','convoke','anthem','go wide'],
+    ramp:        ['add','search your library for','land','landfall','treasure'],
+    control:     ['counter target','flash','destroy all','exile all','draw'],
+    combo:       ['untap','whenever','tap','add','copy','storm','infinite'],
+    aggro:       ['haste','double strike','trample','first strike','menace','whenever attacks'],
+    voltron:     ['equipment','equip','equipped creature','double strike','indestructible','hexproof'],
+    legendary:   ['legendary','historic','whenever a legendary'],
+    reanimate:   ['graveyard','dies','unearth','undying','flashback','dredge'],
+    stax:        ["players can't",'opponents can','each player','spells cost','more to cast','tapped'],
+    spells:      ['magecraft','whenever you cast','instant or sorcery','prowess','copy','storm'],
+    artifacts:   ['artifact','metalcraft','affinity','improvise'],
+    enchantress: ['enchantment','constellation','aura'],
+    sacrifice:   ['sacrifice','whenever a creature dies','whenever you sacrifice'],
+    counters:    ['+1/+1 counter','proliferate'],
+    graveyard:   ['graveyard','from your graveyard','dies','mill','flashback'],
+    lifegain:    ['lifelink','gain life','whenever you gain life'],
+    lands:       ['landfall','search your library for a','additional land'],
+    draw:        ['draw a card','whenever you draw'],
+    storm:       ['storm','whenever you cast'],
+    extraturns:  ['extra turn','take an extra turn'],
+  }[stratId] || [];
+  stratKeys.forEach(kw => { if(tx.includes(kw) || tl.includes(kw)) sc += 3; });
+
+  // ── Sinergia con el oráculo del comandante ─────────────────────────
+  const cmdTxt = (cmdOracleText||'').toLowerCase();
+  // Palabras que activan o repiten la habilidad del comandante
+  ['whenever','trigger','each','draw','token','counter','sacrifice',
+   'graveyard','tap','untap','legendary','equip','attach','proliferate',
+   'magecraft','flash','storm','landfall'].forEach(kw => {
+    if(cmdTxt.includes(kw) && tx.includes(kw)) sc += 1.5;
+  });
+
+  // ── Pilar 2 — Calibración por Turno Crítico y Bracket ─────────────
+  if(br >= 4){
+    // cEDH / Optimizado: bonificar fuertemente bajo CMC con valor
+    if(cmc <= 1 && (isEngine || isEnabler)) sc += 7;
+    if(cmc <= 2 && isInteraction)           sc += 5;
+    if(cmc <= 2 && isEngine)                sc += 5;
+    if(cmc <= 1 && isInteraction)           sc += 4;
+  } else if(br === 3){
+    if(cmc <= 2 && (isEngine || isEnabler)) sc += 4;
+    if(cmc <= 3 && isInteraction)           sc += 3;
+  } else {
+    // Casual: big threats también son válidos
+    if(cmc >= 5 && isPayoff) sc += 3;
   }
 
-  // Coincidencias con habilidades del comandante
-  const cmdKeys = ['whenever','trigger','each','draw','token','counter','sacrifice','graveyard','tap','untap','legendary','equip','attach'];
-  cmdKeys.forEach(kw => { if(cmdTxt.includes(kw) && txt.includes(kw)) sc += 1.5; });
-
-  // Bonus por ser staple (nombre en la lista de siempre-incluir)
-  const staples = ['sol ring','arcane signet','command tower','cyclonic rift','swords to plowshares','path to exile',
-    'counterspell','cultivate','kodama\'s reach','lightning greaves','swiftfoot boots','rhystic study','smothering tithe',
-    'mystic remora','sylvan library','demonic tutor','vampiric tutor','mystical tutor','enlightened tutor',
-    'tutored','mana crypt','chrome mox','mox diamond','dark ritual','cabal ritual','birds of paradise',
-    'llanowar elves','elvish mystic','fyndhorn elves','rampant growth','farseek','nature\'s lore','three visits',
-    'windfall','wheel of fortune','sensei\'s divining top','skullclamp','mind\'s eye','phyrexian arena',
-    'eternal witness','reclamation sage','beast within','naturalize','krosan grip',
-    'sword of','blackblade reforged','captain\'s claws','embercleave','hammer of nazahn',
-    'blackblade reforged','whispersilk cloak','mask of avacyn','nim deathmantle'];
-  if(staples.some(s => (card.name||'').toLowerCase().includes(s))) sc += 8;
+  // ── Pilar 4 — Bonus a piezas de combo / redundancia ───────────────
+  if(br >= 3 && (
+    (tx.includes('untap') && tx.includes('add')) ||
+    tx.includes('infinite') && tx.includes('mana') ||
+    tx.includes('storm') && cmc <= 3
+  )) sc += 5;
 
   return sc;
 }
@@ -2493,13 +2835,13 @@ async function sfQAll(q) {
 
 async function fetchPool(sid){
   const ci = S._ci || [];
-  const colorStr = ci.length ? ci.join('') : 'WUBRG';
-  // IMPORTANTE: para tierras NO usar color<= porque excluye Command Tower, Mana Confluence, etc.
-  // Para el resto, color<= sin legal:commander para máxima cobertura
-  const cfColor = `color<=${colorStr} -is:extra -is:funny`;
+  // id<= = identidad de color (legalidad real en Commander). Incoloro → id:colorless.
+  const idc = ciClause();
+  const cfColor = `${idc} -is:extra -is:funny`;
   const cfColorLegal = `${cfColor} legal:commander`;
-  // Para tierras: solo legalidad, sin filtro de color
-  const cfLands = `-is:extra -is:funny legal:commander`;
+  // Para tierras: filtrar por identidad también (excluye duales fuera de identidad),
+  // pero Command Tower / Mana Confluence (identidad incolora) pasan con id<=.
+  const cfLands = `${idc} -is:extra -is:funny legal:commander`;
 
   const br = S.bracket;
   const strat = getPrimaryStrategy();
@@ -2863,8 +3205,7 @@ async function manSearch(sid){
   const q=el?.value?.trim(); if(!q||q.length<2) return;
   const rEl=document.getElementById('msr-'+sid); if(!rEl) return;
   rEl.style.display='block'; rEl.innerHTML='<div style="padding:8px;text-align:center"><span class="isp"></span></div>';
-  const ci=S._ci||[]; const colorStr=ci.length?ci.join(''):'WUBRG';
-  const cf=`color<=${colorStr} -is:extra`;
+  const cf=`${ciClause()} -is:extra`;
   const typeFilter=sid==='lands'?' t:land':sid==='creatures'?' t:creature':sid==='spells'?' (t:instant OR t:sorcery)':sid==='artifacts'?' t:artifact':sid==='enchants'?' t:enchantment':'';
   // Búsqueda por nombre: primero exacta, luego fuzzy
   let res=await sfQ(`"${q}"${typeFilter} ${cf}`);
@@ -2908,13 +3249,14 @@ function finalize(){
   let landPool=addU([...S.wk.lands]);
 
   // Básicas manuales añadidas con los botones +/−
-  const bm={W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest'};
+  const bm={W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest',C:'Wastes'};
   const basicImgMap={
     W:'https://cards.scryfall.io/normal/front/e/0/e0c9e93d-81a3-4f2e-a7b2-c8cb3b7d7936.jpg',
     U:'https://cards.scryfall.io/normal/front/4/d/4d8edc59-ab9c-4f74-aafd-90c3a5c9b46e.jpg',
     B:'https://cards.scryfall.io/normal/front/6/1/619b2d83-0e83-4f7b-8fa4-9a8a4fa3c4b8.jpg',
     R:'https://cards.scryfall.io/normal/front/b/a/bad5dab5-7e43-4c28-9a33-66b34f8a4fd9.jpg',
-    G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg'
+    G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg',
+    C:'https://api.scryfall.com/cards/named?exact=Wastes&version=normal&format=image'
   };
   Object.entries(S.basicCounts).forEach(([col,count])=>{
     for(let i=0;i<count;i++){
@@ -2928,8 +3270,8 @@ function finalize(){
     }
   });
 
-  // Si aún faltan para llegar al target, rellenar con básicas de los colores del comandante
-  const activeCols=ci.length?ci:['G'];
+  // Si aún faltan para llegar al target, rellenar con básicas de la identidad (incoloro → Yermos)
+  const activeCols=ci.length?ci:['C'];
   let bi=0;
   while(landPool.length<S.landCount){
     const col=activeCols[bi%activeCols.length]; bi++;
@@ -3027,36 +3369,28 @@ function calcPowerLevel(deck, allNL, avgCmc) {
   if (fastMana >= 2) { score += 3; factors.push(`Mana rápido (${fastMana} artefactos de 0 mana) — muy poderoso`); }
   else if (fastMana >= 1) { score += 1; factors.push('Algo de mana rápido (0 cost artifact)'); }
 
-  // ── Bracket seleccionado por el usuario como ajuste ──────
-  const userBracket = S.bracket || 2;
-  score += (userBracket - 1) * 0.6;
-
-  // ── Mapear score a bracket 1-5 ───────────────────────────
+  // ── Bracket: el usuario manda — el score solo informa ──────
+  // El bracket elegido en el wizard ES el bracket del mazo.
+  // El score calculado (1-10) es un indicador de potencia pero
+  // no sobrescribe la decisión del piloto.
   score = Math.min(10, Math.max(1, Math.round(score)));
-  let bracket, name, desc, color, gradient;
-  if (score <= 2) {
-    bracket=1; name='Casual'; color='#4caf7d';
-    desc='Mazo casual con pocas sinergias fuertes. Ideal para grupos relajados.';
-    gradient='rgba(76,175,125,.08)';
-  } else if (score <= 4) {
-    bracket=2; name='Mejorado'; color='#4a9edd';
-    desc='Mazo competente con buenas sinergias. Puede ganar consistentemente.';
-    gradient='rgba(74,158,221,.08)';
-  } else if (score <= 6) {
-    bracket=3; name='Poderoso'; color='#d4a843';
-    desc='Mazo potente con interacción fuerte y posibles combos. Apto para mesas competitivas.';
-    gradient='rgba(212,168,67,.08)';
-  } else if (score <= 8) {
-    bracket=4; name='Optimizado'; color='#e05555';
-    desc='Mazo de alto nivel. Combos explosivos, tutores y fuerte interacción.';
-    gradient='rgba(224,85,85,.08)';
-  } else {
-    bracket=5; name='cEDH'; color='#c026d3';
-    desc='Máximo poder. Mana de coste 0, combos de turno 1-3 y contraespeles masivos. Solo para mesas cEDH.';
-    gradient='rgba(192,38,211,.08)';
-  }
 
-  return { score, bracket, name, desc, color, gradient, factors };
+  const userBracket = S.bracket || 3;
+  const bracketMeta = {
+    1: { name:'Casual',     color:'#4caf7d', gradient:'rgba(76,175,125,.08)',
+         desc:'Mazo casual con pocas sinergias fuertes. Ideal para grupos relajados.' },
+    2: { name:'Mejorado',   color:'#4a9edd', gradient:'rgba(74,158,221,.08)',
+         desc:'Mazo competente con buenas sinergias. Puede ganar consistentemente.' },
+    3: { name:'Poderoso',   color:'#d4a843', gradient:'rgba(212,168,67,.08)',
+         desc:'Mazo potente con interacción fuerte y posibles combos. Apto para mesas competitivas.' },
+    4: { name:'Optimizado', color:'#e05555', gradient:'rgba(224,85,85,.08)',
+         desc:'Mazo de alto nivel. Combos explosivos, tutores y fuerte interacción.' },
+    5: { name:'cEDH',       color:'#c026d3', gradient:'rgba(192,38,211,.08)',
+         desc:'Máximo poder. Mana de coste 0, combos de turno 1-3 y contraespeles masivos. Solo para mesas cEDH.' },
+  };
+  const { name, color, gradient, desc } = bracketMeta[userBracket] || bracketMeta[3];
+
+  return { score, bracket: userBracket, name, desc, color, gradient, factors };
 }
 
 
@@ -3285,57 +3619,79 @@ async function genAnalysis(deck){
     : '';
 
   if(S.apiKey){
-    const prompt = `Eres un experto en Magic: The Gathering Commander. Analiza ESTE MAZO ESPECÍFICO carta por carta y escribe una guía estratégica personalizada en español. Es fundamental que menciones cartas concretas del mazo por su nombre real en cada sección.
+    const systemPrompt = `Eres un Analista de Metajuego y Arquitecto de Combos para Magic: The Gathering, especializado en el formato Commander con calibración para entornos cEDH. Tu nivel de referencia es un Juez Pro Tour con experiencia en torneos de alto nivel.
 
-═══════════════════════════════════════
-COMANDANTE(S)
-═══════════════════════════════════════
+ROL Y PERSONALIDAD:
+- No eres un asistente genérico. Nunca tratas al interlocutor como jugador casual salvo evidencia explícita.
+- Hablas en lenguaje avanzado: Tempo, Card Advantage, Fast Mana, Threat Assessment, Pila, Win-Con, Turbo, Stax, Midrange, Pieza de Combo, Payoff, Enabler, Engine.
+- Tu análisis es clínico, no entusiasta. No dices "Esta carta es increíble". Dices "Esta carta resuelve el cuello de botella en T2 y genera ventaja diferida."
+- Asumes conocimiento del reglamento avanzado: prioridad, fases, Pila, timing Instantáneos vs Conjuros, triggers ETB.
+- Nunca mencionas Sol Ring, Command Tower, Arcane Signet como sugerencias proactivas — son datos por defecto. Solo si su ausencia es el problema.
+
+LOS 4 PILARES DE EVALUACIÓN (obligatorios, no opcionales):
+
+PILAR 1 — SINERGIA REAL vs. CARTAS TRAMPA
+Sinergia real: la carta cumple al menos 2 de 3 → (1) activa/acelera/protege una línea de victoria; (2) genera card advantage o maná en el contexto específico del mazo; (3) es buscable por tutores presentes.
+Carta Trampa [TRAP]: CMC prohibitivo sin justificación | Conjuro donde se necesita Instantáneo | Table Dependency | Do-Nothing Permanent | Flavor Trap.
+Clasifica cada carta relevante como: [ENGINE] [ENABLER] [PAYOFF] [INTERACTION] [TRAP].
+
+PILAR 2 — CURVA DINÁMICA Y TURNO CRÍTICO
+Turno Crítico por arquetipo: Turbo-Combo T2-T3 | Midrange T3-T4 | Control/Stax T4-T5 | Aggro-Tempo T3.
+Evalúa Fast Mana disponible, densidad de tutores CMC≤2, redundancia de líneas de combo, coste de relanzar el Comandante.
+Mulligan: Keep automático con 3 pilares (Fast Mana + Acceso al combo + Interacción). Mulligan si cumple menos de 2.
+
+PILAR 3 — THREAT ASSESSMENT
+Los puntos de vida NO son amenaza primaria. Jerarquía: CRÍTICO (combo en pila o stax que bloquea tu win-con) > ALTO (motor de card advantage resuelto como Rhystic Study) > MEDIO (presión de combate sin cierre) > BAJO (valor acumulativo sin impacto inmediato).
+Ventana de Interacción Óptima: responde en la Pila cuando el hechizo resuelto es irrecuperable. No gastes interacción en amenazas MEDIO/BAJO si hay una CRÍTICA sin cubrir.
+
+PILAR 4 — EFICIENCIA DE COMBO Y WIN-CONDITIONS
+Win-con válida en cEDH: ≤3 piezas | accesible por tutores presentes | resiste interacción común | cierra en el mismo turno.
+Densidad mínima: 2 líneas primarias con piezas solapadas + 1 línea secundaria + 6-8 tutores CMC≤2.
+Una pieza sin redundancia es un cuello de botella crítico.
+
+PROHIBICIONES ESTRICTAS:
+- Jamás sugieras "más remoción" sin especificar cuál, por qué CMC y contra qué amenaza del meta.
+- No evalúes en el vacío: toda evaluación considera metajuego real.
+- No recomiendes CMC≥5 sin justificar que el impacto compensa la lentitud.
+- No confundas temática con sinergia.
+- No omitas Cartas Trampa: el silencio sobre un problema no es análisis.`;
+
+    const userPrompt = `DATOS DEL MAZO:
+
+COMANDANTE(S):
 ${cmdDesc}
 
-═══════════════════════════════════════
 ESTRATEGIA: ${strat.name} | BRACKET ${S.bracket} (${bdata.name})
-═══════════════════════════════════════
 
-═══════════════════════════════════════
-CARTAS DEL MAZO (con texto de oráculo)
-═══════════════════════════════════════
+LISTA CON TEXTO DE ORÁCULO:
 ${deckBlock}
 
 ${landsBlock}
 
-═══════════════════════════════════════
-INSTRUCCIONES PARA EL ANÁLISIS
-═══════════════════════════════════════
-Escribe una guía estratégica ESPECÍFICA para este mazo. Cita cartas por su nombre real en cada punto. No generalices — analiza lo que realmente está en el mazo.
+INSTRUCCIÓN: Produce el análisis completo en español citando nombres reales de cartas de esta lista en cada sección. No generalices.
 
-## 1. VISIÓN GENERAL
-Describe el concepto del mazo en 3-4 frases. ¿Qué hace el comandante? ¿Cómo encajan las cartas con sus habilidades específicas?
+## 1. DIAGNÓSTICO RÁPIDO
+Arquetipo (Turbo/Midrange/Control/Stax/Aggro-Tempo) · Turno Crítico objetivo · Viabilidad cEDH (Tier 1 / Tier 1.5 / Tier 2 / No competitivo) · Fortaleza principal en una frase · Debilidad principal en una frase.
 
-## 2. PLAN DE JUEGO POR FASES
-**Turno 1-3 (Early):** Qué cartas específicas del mazo jugar. Nombra las piezas de ramp concretas que tienes.
-**Turno 4-6 (Mid):** Cómo desarrollar la estrategia. Qué criaturas/encantamientos establecer. Cuándo sacar al comandante.
-**Turno 7+ (Late):** Cómo cerrar. Qué amenazas finales tienes en el mazo.
+## 2. MOTORES Y WIN-CONDITIONS
+Lista las Win-Conditions con sus piezas exactas del mazo, CMC total de la línea y qué tutores de la lista las buscan. Clasifica los motores de ventaja: [ENGINE] [ENABLER] [PAYOFF]. Evalúa densidad de combo (Alta/Media/Baja) con justificación.
 
-## 3. SINERGIAS CLAVE
-Lista exactamente 4-6 sinergias entre cartas concretas del mazo. Formato: "**Carta A** + **Carta B**: explicación de por qué funcionan juntas y qué generan."
+## 3. CUELLOS DE BOTELLA
+Lista numerada por impacto: puntos de falla únicos sin redundancia · Cartas Trampa [TRAP] con justificación específica (CMC, velocidad, table dependency) · Gaps en curva o interacción · Vulnerabilidades a arquetipos concretos del meta (qué carta específica del meta destruye este plan).
 
-## 4. COMBOS Y RUTAS DE VICTORIA
-Analiza el texto de oráculo de las cartas y detecta:
-- Combos infinitos posibles (mana infinito, tokens infinitos, loops de robo, etc.)
-- Si hay combo, explica las piezas exactas paso a paso
-- Si no hay combo infinito, describe las 2-3 interacciones más poderosas del mazo
+## 4. SUGERENCIAS TÉCNICAS
+Máximo 5-7 swaps. Formato estricto por cada uno:
+OUT: [carta] — razón funcional (no "es mala": qué cuello de botella crea, CMC, por qué falla en el turno crítico)
+IN: [carta sugerida] — CMC, categoría [ENGINE/ENABLER/PAYOFF/INTERACTION], qué cuello de botella resuelve
+RAZÓN: impacto concreto en el Turno Crítico o en la densidad de combo.
 
-## 5. CARTAS ESTRELLA
-Las 3-5 cartas más importantes del mazo (fuera del comandante) y por qué son imprescindibles en este build específico.
+## 5. MULLIGAN Y VENTANA DE INTERACCIÓN
+**Pillar Check — mano ideal:** cuáles son las 2-3 cartas específicas de esta lista imprescindibles en apertura y por qué activan el plan.
+**Fast Mana disponible:** qué aceleración tiene este mazo y si es suficiente para el arquetipo.
+**Ventana de interacción óptima:** cuándo NO gastar interacción y cuándo es obligatorio responder en la Pila en el contexto de este mazo.
 
-## 6. DEBILIDADES Y CÓMO JUGARLAS
-¿A qué es vulnerable este mazo? ¿Qué tipos de respuesta le hacen daño? ¿Cómo jugar alrededor de esas debilidades con las cartas que tienes?
-
-## 7. MULLIGAN Y MANO IDEAL
-¿Qué buscar en el mulligan? ¿Qué cartas del mazo necesitas tener sí o sí en la mano de apertura?
-
-## 8. CONSEJOS AVANZADOS
-2-3 consejos no obvios específicos para este mazo.`;
+## 6. VEREDICTO FINAL
+Resumen ejecutivo en 3-4 frases. Posición real en el meta según el bracket declarado. Una pregunta estratégica concreta que el piloto debe responder antes de finalizar la lista.`;
 
     try {
       const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -3347,18 +3703,23 @@ Las 3-5 cartas más importantes del mazo (fuera del comandante) y por qué son i
           'anthropic-dangerous-direct-browser-access': 'true'
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 2500,
-          messages: [{ role: 'user', content: prompt }]
+          model: 'claude-sonnet-4-6',
+          max_tokens: 3000,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userPrompt }]
         })
       });
       if(res.ok){
         const d = await res.json();
         const txt = d.content?.[0]?.text || '';
-        showAnalysis(txt);
-        return;
+        if(txt){ showAnalysis(txt); return; }
+      } else {
+        const errBody = await res.json().catch(()=>({}));
+        console.error('[Claude análisis] HTTP', res.status, errBody);
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error('[Claude análisis] excepción:', e);
+    }
   }
 
   // Sin IA — análisis local basado en texto de oráculo real de las cartas
@@ -3369,15 +3730,39 @@ function showAnalysis(txt){
   const loadEl = document.getElementById('sa-loading');
   const bodyEl = document.getElementById('sa-body');
   if(loadEl) loadEl.style.display = 'none';
-  if(bodyEl){
-    bodyEl.style.display = 'block';
-    // Renderizar markdown básico: ## headers y **bold**
-    bodyEl.innerHTML = txt
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-      .replace(/^## (.+)$/gm, '<div style="font-size:13px;font-weight:700;color:var(--gold);margin:14px 0 5px">$1</div>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong style="color:var(--text)">$1</strong>')
-      .replace(/\n/g, '<br>');
+  if(!bodyEl) return;
+  bodyEl.style.display = 'block';
+  // Conjunto de nombres de carta del mazo → solo esos en negrita son "hovereables".
+  const names = new Set();
+  const imgByName = {};
+  const d = S.deck;
+  if(d){
+    const add = c => {
+      if(!c?.name) return;
+      const k = c.name.toLowerCase();
+      names.add(k);
+      const im = c.image_uris?.normal || c.card_faces?.[0]?.image_uris?.normal || '';
+      if(im) imgByName[k] = im;
+    };
+    (d.commanders||[]).forEach(add);
+    (d.lands||[]).forEach(add);
+    Object.values(d.sections||{}).forEach(arr=>arr.forEach(add));
   }
+  // Renderizar markdown básico: ## headers y **bold** (cartas con hover, resto normal)
+  bodyEl.innerHTML = txt
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/^## (.+)$/gm, '<div style="font-size:13px;font-weight:700;color:var(--gold);margin:14px 0 5px">$1</div>')
+    .replace(/\*\*(.+?)\*\*/g, (m, p1) => {
+      const clean = p1.trim();
+      const key = clean.toLowerCase();
+      if(names.has(key)){
+        const esc = clean.replace(/'/g,"\\'");
+        const img = (imgByName[key]||'').replace(/'/g,"\\'");
+        return `<strong class="an-card" style="color:var(--gold);cursor:help;border-bottom:1px dotted rgba(212,168,67,.55)" onmouseenter="showZByName(event,'${esc}','${img}')" onmouseleave="hideZ()">${clean}</strong>`;
+      }
+      return `<strong style="color:var(--text)">${clean}</strong>`;
+    })
+    .replace(/\n/g, '<br>');
 }
 
 function buildLocalAnalysis(deck, strat, bdata){
@@ -3554,7 +3939,7 @@ function restart(){
   S={mode:null,strategies:[],strategy:null,bracket:null,colors:[],cmdData:null,partnerData:null,apiKey:k,
      tribe:null,tribeName:null,tribeColors:[],_essentialsDone:false,budget:null,
      wk:{lands:[],ramp:[],creatures:[],spells:[],artifacts:[],enchants:[]},
-     pools:{},landCount:36,activeSec:'essentials',deck:null,basicCounts:{W:0,U:0,B:0,R:0,G:0}};
+     pools:{},landCount:36,activeSec:'essentials',deck:null,basicCounts:{W:0,U:0,B:0,R:0,G:0,C:0}};
   _wkEssCache=null; _wkEssImgs={};
   goPanel('home');renderHome();
 }
@@ -3657,13 +4042,15 @@ async function buildAutomatic(tribalMode) {
   if(!cmd){ alert('Selecciona un comandante primero.'); return; }
   const ci1 = cmd?.color_identity||[]; const ci2 = partner?.color_identity||[];
   S._ci = [...new Set([...ci1,...ci2])];
-  S._cf = `color<=${S._ci.length?S._ci.join(''):'WUBRG'} legal:commander -is:extra -is:funny`;
+  S._cf = `${ciClause()} legal:commander -is:extra -is:funny`;
   const strat = getPrimaryStrategy();
   const stratDisplay = (S.strategies?.length > 1)
     ? S.strategies.map(id=>{ const s=STRATEGIES.find(x=>x.id===id); return s?`${s.icon} ${s.name}`:''; }).join(' · ')
     : `${strat.icon} ${strat.name}`;
-  const colorStr = S._ci.length ? S._ci.join('') : 'WUBRG';
-  const cfLegal = `color<=${colorStr} legal:commander -is:extra -is:funny`;
+  const colorStr = S._ci.length ? S._ci.join('') : '';      // letras de identidad ('' = incoloro)
+  const idc = ciClause();                                    // clause id<= / id:colorless
+  const cfLegal = `${idc} legal:commander -is:extra -is:funny`;
+  const themes = detectThemes();                             // temas del mazo (comprensión)
   const budget = S.budget; // null = sin límite
 
   const cmdImg = cmd?.image_uris?.art_crop || cmd?.image_uris?.normal || '';
@@ -3732,7 +4119,7 @@ async function buildAutomatic(tribalMode) {
 
   // Reset estado
   S.wk = {lands:[],ramp:[],creatures:[],spells:[],artifacts:[],enchants:[]};
-  S.basicCounts = {W:0,U:0,B:0,R:0,G:0};
+  S.basicCounts = {W:0,U:0,B:0,R:0,G:0,C:0};
   S.landCount = 36;
   _wkEssCache = null;
   _wkEssImgs  = {};
@@ -3765,16 +4152,112 @@ async function buildAutomatic(tribalMode) {
   setProgress(15);
 
   // Función para puntuar una carta por sinergia EDHREC
+  // IMPORTANTE: debe estar definida antes del paso de esenciales
   const edhScore = (card) => {
     const data = edhByName[(card.name||'').toLowerCase()];
     if (data) {
-      // inclusion va de 0-100%, num_decks es número absoluto
       return data.inclusion > 0 ? data.inclusion : Math.min(data.num_decks / 100, 99);
     }
-    // Sin datos EDHREC: usar rank global como proxy (invertido)
     const rank = card.edhrec_rank || 9999;
     return Math.max(0, 100 - rank/100);
   };
+
+  // ── PASO 1b: GARANTÍA DE ESENCIALES ────────────────────────────────
+  // Las top cartas de EDHREC se incluyen directamente en el mazo, sin depender
+  // de que las queries de Scryfall las devuelvan por casualidad.
+  // Número de esenciales según bracket: bracket alto = menos combo-staples, más fair.
+  const br = S.bracket || 3;
+  const numEssentials = br <= 2 ? 30 : br === 3 ? 22 : br === 4 ? 14 : 8;
+  // Tomar las top N de EDHREC que no sean el propio comandante
+  const topEdhNames = edhList
+    .filter(x => x.name && x.name.toLowerCase() !== cmd.name.toLowerCase()
+               && (!partner || x.name.toLowerCase() !== partner.name.toLowerCase()))
+    .sort((a,b) => (b.inclusion||0) - (a.inclusion||0))
+    .slice(0, numEssentials)
+    .map(x => x.name);
+
+  // Buscar los objetos-carta en Scryfall en lotes de 6 (colección)
+  const essentialCards = [];
+  if (topEdhNames.length > 0) {
+    const BATCH = 6;
+    for (let i = 0; i < topEdhNames.length; i += BATCH) {
+      const batch = topEdhNames.slice(i, i + BATCH);
+      try {
+        const identifiers = batch.map(n => ({ name: n }));
+        const res = await fetch(`${SF}/cards/collection`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifiers })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          (data.data || []).forEach(c => {
+            // Verificar identidad de color: la carta debe ser legal con este comandante
+            const cardId = c.color_identity || [];
+            const legalId = S._ci.length === 0
+              ? cardId.length === 0                               // incoloro: solo incoloras
+              : cardId.every(col => S._ci.includes(col));         // coloreado: subconjunto
+            if (legalId && !usedIds.has(c.id)) {
+              // Marcar con score alto para que queden al inicio del pool
+              essentialCards.push({...c, _edh: edhScore(c) + 50, _essential: true});
+            }
+          });
+        }
+      } catch(e) { /* si falla un lote, continuar */ }
+    }
+  }
+
+  // Distribuir esenciales por tipo en las secciones del workshop
+  const essentialsBySection = { ramp:[], creatures:[], spells:[], artifacts:[], enchants:[] };
+  for (const c of essentialCards) {
+    const tl = (c.type_line || '').toLowerCase();
+    const tx = ((c.oracle_text||'') + ' ' + (c.card_faces||[]).map(f=>f.oracle_text||'').join(' ')).toLowerCase();
+    const isLand = tl.includes('land');
+    if (isLand) continue; // Las tierras se gestionan aparte
+    const isArt   = tl.includes('artifact');
+    const isEnch  = tl.includes('enchantment');
+    const isCreat = tl.includes('creature');
+    const isInst  = tl.includes('instant');
+    const isSorc  = tl.includes('sorcery');
+    const isRamp  = isArt && (tx.includes('add') && tx.includes('mana') || tx.includes('mana rock'))
+                  || (isCreat || isInst || isSorc) && tx.includes('search your library') && tx.includes('land')
+                  || (isInst || isSorc) && tx.includes('add') && (tx.includes('{w}') || tx.includes('{u}') || tx.includes('{b}') || tx.includes('{r}') || tx.includes('{g}') || tx.includes('{c}'));
+    if (isRamp)       essentialsBySection.ramp.push(c);
+    else if (isArt)   essentialsBySection.artifacts.push(c);
+    else if (isEnch)  essentialsBySection.enchants.push(c);
+    else if (isCreat) essentialsBySection.creatures.push(c);
+    else if (isInst || isSorc) essentialsBySection.spells.push(c);
+  }
+
+  // Ordenar por score EDHREC desc dentro de cada sección antes de sembrar
+  Object.values(essentialsBySection).forEach(arr => arr.sort((a,b) => (b._edh||0) - (a._edh||0)));
+
+  // Sembrar esenciales en las secciones (se marcan como usados para no duplicar)
+  const seedEssentials = (section, cards) => {
+    const target = getTarget(section);
+    const take = Math.min(cards.length, Math.ceil(target * 0.4)); // máx 40% de la sección
+    for (let i = 0; i < take; i++) {
+      const c = cards[i];
+      if (!usedIds.has(c.id)) { usedIds.add(c.id); S.wk[section].push(c); }
+    }
+  };
+  seedEssentials('ramp',      essentialsBySection.ramp);
+  seedEssentials('creatures', essentialsBySection.creatures);
+  seedEssentials('spells',    essentialsBySection.spells);
+  seedEssentials('artifacts', essentialsBySection.artifacts);
+  seedEssentials('enchants',  essentialsBySection.enchants);
+
+  const totalSeeded = Object.values(S.wk).reduce((a,b)=>a+b.length,0);
+  const seededBreakdown = Object.entries(essentialsBySection)
+    .filter(([,v])=>v.length>0)
+    .map(([k,v])=>`${k}:${v.length}`).join(' ');
+  log(`Esenciales EDHREC: ${essentialCards.length} cartas encontradas → ${totalSeeded} sembradas en secciones${seededBreakdown?' ('+seededBreakdown+')':''}`);
+  if(essentialCards.length === 0){
+    log('⚠ EDHREC no devolvió datos para este comandante — el build usará sólo Scryfall');
+  }
+  setProgress(22);
+
+  // edhScore definida arriba (ver línea EDHREC build)
 
   // Budget is TOTAL deck price. Derive per-card ceiling to keep total under budget.
   // ~64 non-basic, non-commander slots. Ceiling = budget / 15 lets some pricier staples
@@ -3792,14 +4275,15 @@ async function buildAutomatic(tribalMode) {
     return cards
       .filter(c => {
         if (usedIds.has(c.id)) return false;
-        // Per-card ceiling derived from total budget
         if (perCardCeiling) {
           const price = cardPrice(c);
           if (price > 0 && price > perCardCeiling) return false;
         }
         return true;
       })
-      .map(c => ({...c, _edh: edhScore(c)}))
+      // _edh = EDHREC score (0-100) + bonus temático del mazo
+      // Garantiza que artefactos → criaturas-artefacto, cementerio → flashback, etc.
+      .map(c => ({...c, _edh: edhScore(c) + themeBonus(c, themes)}))
       .sort((a,b) => b._edh - a._edh);
   };
 
@@ -3812,9 +4296,8 @@ async function buildAutomatic(tribalMode) {
   const landPool = await fetchAndScore(`t:land ${cfLegal} -t:basic`);
   const specialLands = addUnique(landPool, 22);
 
-  // Básicas para llegar a 36
-  const bm = {W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest'};
-  const activeCols = S._ci.length ? S._ci : ['G'];
+  // Básicas para llegar a 36 (incoloro → Yermos)
+  const activeCols = basicCols();
   const basicPerColor = Math.max(1, Math.floor((36 - specialLands.length) / activeCols.length));
   activeCols.forEach(col => { S.basicCounts[col] = basicPerColor; });
   // Ajustar para llegar exactamente a 36
@@ -3841,7 +4324,8 @@ async function buildAutomatic(tribalMode) {
   const rampMerged = [];
   rampPools.flat().forEach(c => { if(!rampMerged.find(x=>x.id===c.id)) rampMerged.push(c); });
   rampMerged.sort((a,b) => b._edh - a._edh);
-  S.wk.ramp = addUnique(rampMerged, getTarget('ramp'));
+  const rampNeeded = Math.max(0, getTarget('ramp') - S.wk.ramp.length);
+  S.wk.ramp.push(...addUnique(rampMerged, rampNeeded));
   secState('ramp', 'done'); secCount('ramp', S.wk.ramp.length, getTarget('ramp'));
   updateLastLog(`Ramp: ${S.wk.ramp.length} piezas (top por % inclusión EDHREC)`);
   setProgress(45);
@@ -3850,7 +4334,6 @@ async function buildAutomatic(tribalMode) {
   secState('creatures', 'building');
   log('Seleccionando criaturas por sinergia EDHREC...', false);
 
-  // Obtener criaturas de múltiples queries para máxima cobertura
   const creaturePage1 = await fetchAndScore(`t:creature ${cfLegal}`);
   const creaturePage2 = await fetchAndScore(`t:creature ${cfLegal} cmc<=4`);
   const creaturePage3 = await fetchAndScore(`t:creature ${cfLegal} cmc>=5`);
@@ -3859,27 +4342,31 @@ async function buildAutomatic(tribalMode) {
   for(const c of [...creaturePage1, ...creaturePage2, ...creaturePage3]){
     if(!seenCrAuto.has(c.id)){ seenCrAuto.add(c.id); creaturePool.push(c); }
   }
-  // Si hay tribu, añadir bonus a criaturas del tipo al frente
+  // Inyectar queries temáticas — garantiza criatura-artefacto para artefactos,
+  // criatura de cementerio para reanimador, legendaria para Legendary Matters, etc.
+  for(const tq of themeQueries('creatures', idc)){
+    const tpool = await fetchAndScore(tq);
+    tpool.forEach(c => { if(!seenCrAuto.has(c.id)){ seenCrAuto.add(c.id); creaturePool.push({...c, _edh: c._edh+5}); }});
+  }
   if (S.tribe) {
     const tribePool = await fetchAndScore(`t:creature t:"${S.tribe}" ${cfLegal}`);
     tribePool.forEach(c => { if(!seenCrAuto.has(c.id)){ seenCrAuto.add(c.id); creaturePool.unshift({...c, _edh: c._edh+10}); }});
   }
-  // Para legendary matters y voltron: bonus a criaturas legendarias
   const stratId = getPrimaryStrategy()?.id || '';
   if(stratId === 'legendary' || stratId === 'voltron'){
     const legPool = await fetchAndScore(`t:creature t:legendary ${cfLegal}`);
     legPool.forEach(c => { if(!seenCrAuto.has(c.id)){ seenCrAuto.add(c.id); creaturePool.unshift({...c, _edh: c._edh+10}); }});
-    // También subir puntuación de los legendarios ya en el pool
     creaturePool.forEach(c => {
       if((c.type_line||'').toLowerCase().includes('legendary')) c._edh = (c._edh||0) + 8;
     });
   }
   creaturePool.sort((a,b) => b._edh - a._edh);
 
-  S.wk.creatures = addUnique(creaturePool, getTarget('creatures'));
-
-  // Fallback: si el pool no era suficiente, buscar con queries más amplias sin filtros de sinergia
   const crTarget = getTarget('creatures');
+  const crNeeded = Math.max(0, crTarget - S.wk.creatures.length);
+  S.wk.creatures.push(...addUnique(creaturePool, crNeeded));
+
+  // Fallback: si el pool no era suficiente, buscar con queries más amplias
   if (S.wk.creatures.length < crTarget) {
     const needed = crTarget - S.wk.creatures.length;
     const fallbackPool = await fetchAndScore(`t:creature ${cfLegal} -t:legendary`);
@@ -3905,6 +4392,7 @@ async function buildAutomatic(tribalMode) {
     `(t:instant OR t:sorcery) (o:"search your library") ${cfLegal} -o:"basic land"`,
     `(t:instant OR t:sorcery) ${cfLegal} cmc<=2`,
     `(t:instant OR t:sorcery) ${cfLegal} cmc<=4`,
+    ...themeQueries('spells', idc),
   ];
   const spellMerged = [];
   const seenSpAuto = new Set();
@@ -3913,7 +4401,8 @@ async function buildAutomatic(tribalMode) {
     for(const c of r) if(!seenSpAuto.has(c.id)){ seenSpAuto.add(c.id); spellMerged.push(c); }
   }
   spellMerged.sort((a,b) => b._edh - a._edh);
-  S.wk.spells = addUnique(spellMerged, getTarget('spells'));
+  const spNeeded = Math.max(0, getTarget('spells') - S.wk.spells.length);
+  S.wk.spells.push(...addUnique(spellMerged, spNeeded));
   // Fallback conjuros: si no llega al target añadir cualquier instant/sorcery legal
   if (S.wk.spells.length < getTarget('spells')) {
     const spFallback = await fetchAndScore(`(t:instant OR t:sorcery) ${cfLegal}`);
@@ -3932,14 +4421,16 @@ async function buildAutomatic(tribalMode) {
     fetchAndScore(`t:equipment ${cfLegal}`),
     fetchAndScore(`t:artifact -t:creature -o:"add" -o:"mana" ${cfLegal} cmc>=2`),
     fetchAndScore(`t:artifact ${cfLegal} -t:creature`),
+    // Queries temáticas (artefactos legendarios, contadores en artefactos, etc.)
+    ...themeQueries('artifacts', idc).map(q => fetchAndScore(q)),
   ];
   const artPools = await Promise.all(artQAuto);
   const artMerged = [];
   const seenArAuto = new Set();
   artPools.flat().forEach(c => { if(!seenArAuto.has(c.id)){ seenArAuto.add(c.id); artMerged.push(c); }});
   artMerged.sort((a,b) => b._edh - a._edh);
-  S.wk.artifacts = addUnique(artMerged, getTarget('artifacts'));
-  // Fallback artefactos
+  const arNeeded = Math.max(0, getTarget('artifacts') - S.wk.artifacts.length);
+  S.wk.artifacts.push(...addUnique(artMerged, arNeeded));
   if (S.wk.artifacts.length < getTarget('artifacts')) {
     const arFallback = await fetchAndScore(`t:artifact ${cfLegal}`);
     const arExtra = addUnique(arFallback.filter(c => !S.wk.artifacts.find(x=>x.id===c.id)), getTarget('artifacts') - S.wk.artifacts.length);
@@ -3958,6 +4449,7 @@ async function buildAutomatic(tribalMode) {
     `t:enchantment ${cfLegal} -t:artifact`,
     `t:enchantment t:aura ${cfLegal}`,
     `t:enchantment t:saga ${cfLegal}`,
+    ...themeQueries('enchants', idc),
   ];
   const enchMerged = [];
   const seenEnAuto = new Set();
@@ -3966,7 +4458,8 @@ async function buildAutomatic(tribalMode) {
     for(const c of r) if(!seenEnAuto.has(c.id)){ seenEnAuto.add(c.id); enchMerged.push(c); }
   }
   enchMerged.sort((a,b) => b._edh - a._edh);
-  S.wk.enchants = addUnique(enchMerged, getTarget('enchants'));
+  const enNeeded = Math.max(0, getTarget('enchants') - S.wk.enchants.length);
+  S.wk.enchants.push(...addUnique(enchMerged, enNeeded));
   // Fallback encantamientos
   if (S.wk.enchants.length < getTarget('enchants')) {
     const enFallback = await fetchAndScore(`t:enchantment ${cfLegal}`);
@@ -4012,7 +4505,7 @@ async function buildAutomatic(tribalMode) {
       // Rellenar los huecos con cartas baratas (eur<=cheapCap) bien puntuadas por EDHREC
       const totalRemoved = Object.values(removed).reduce((a,b)=>a+b,0);
       if (totalRemoved > 0) {
-        const cheapPool = await fetchAndScore(`legal:commander color<=${colorStr} -is:extra -is:funny -t:basic eur<=${cheapCap.toFixed(2)}`);
+        const cheapPool = await fetchAndScore(`legal:commander ${idc} -is:extra -is:funny -t:basic eur<=${cheapCap.toFixed(2)}`);
         for (const sec of sections) {
           const needed = removed[sec];
           if (!needed) continue;
@@ -4076,14 +4569,15 @@ async function buildAutomatic(tribalMode) {
 function finalizeDeckAuto() {
   const cmd = S.cmdData; const partner = S.partnerData;
   const ci = S._ci || [];
-  const bm = {W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest'};
-  const activeCols = ci.length ? ci : ['G'];
+  const bm = {W:'Plains',U:'Island',B:'Swamp',R:'Mountain',G:'Forest',C:'Wastes'};
+  const activeCols = ci.length ? ci : ['C'];
   const basicImgMap = {
     W:'https://cards.scryfall.io/normal/front/e/0/e0c9e93d-81a3-4f2e-a7b2-c8cb3b7d7936.jpg',
     U:'https://cards.scryfall.io/normal/front/4/d/4d8edc59-ab9c-4f74-aafd-90c3a5c9b46e.jpg',
     B:'https://cards.scryfall.io/normal/front/6/1/619b2d83-0e83-4f7b-8fa4-9a8a4fa3c4b8.jpg',
     R:'https://cards.scryfall.io/normal/front/b/a/bad5dab5-7e43-4c28-9a33-66b34f8a4fd9.jpg',
-    G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg'
+    G:'https://cards.scryfall.io/normal/front/6/2/62d4b0bf-2cc2-4c17-bfe0-32b9c3cfddaf.jpg',
+    C:'https://api.scryfall.com/cards/named?exact=Wastes&version=normal&format=image'
   };
   const usedIds = new Set([cmd.id, ...(partner?[partner.id]:[])]);
   const addU = pool => { const r=[]; for(const c of pool){ if(!usedIds.has(c.id)){usedIds.add(c.id);r.push(c);}} return r; };
@@ -4524,127 +5018,178 @@ async function analyzeOptimize(){
   const raw = document.getElementById('opt-input').value.trim();
   if(!raw){ alert('Pega tu lista de mazo primero'); return; }
   const resultEl = document.getElementById('opt-result');
-  resultEl.innerHTML=`<div class="ldc"><div class="spin-big"></div>Analizando tu mazo con EDHREC e IA...</div>`;
 
-  // Parse card names from the list
+  // ── helper para mostrar progreso en pantalla ──
+  const status = (msg) => {
+    resultEl.innerHTML = `<div class="ldc"><div class="spin-big"></div>${msg}</div>`;
+  };
+
+  // ── 1. Parsear nombres ──────────────────────────────────────────────
   const cardNames = [];
+  let cmdrFromTag = '';
   raw.split('\n').forEach(line => {
     line = line.trim();
     if(!line || line.startsWith('//') || line.startsWith('#')) return;
-    // Strip quantity prefix: "1 Sol Ring", "4x Sol Ring", "Sol Ring"
+    const cmdrMark = line.match(/^(?:\d+[xX]?\s+)?(.+?)\s+\*CMDR\*/i);
+    if(cmdrMark){ cmdrFromTag = cmdrMark[1].trim(); }
     const m = line.match(/^\d+[xX]?\s+(.+)/) || line.match(/^(.+)/);
-    if(m) {
+    if(m){
       const name = m[1].replace(/\s*\*CMDR\*.*/, '').trim();
       if(name) cardNames.push(name);
     }
   });
 
   if(cardNames.length < 5){
-    resultEl.innerHTML=`<div class="ebox">Necesitas al menos 5 cartas para analizar el mazo.</div>`;
+    resultEl.innerHTML = `<div class="ebox">Necesitas al menos 5 cartas para analizar el mazo.</div>`;
     return;
   }
 
-  // Detect commander (card marked *CMDR* is authoritative, otherwise first legendary creature in original list)
-  let cmdName = '';
-  const cmdrMatch = raw.match(/^\d+[xX]?\s+(.+?)\s+\*CMDR\*/im);
-  if(cmdrMatch) cmdName = cmdrMatch[1].trim();
-
-  // Fetch card data from Scryfall to get color identity, oracle text, etc.
-  resultEl.innerHTML=`<div class="ldc"><div class="spin-big"></div>Consultando Scryfall para ${cardNames.length} cartas...</div>`;
-
+  // ── 2. Fetch datos Scryfall (en lotes de 8, hasta 80 cartas) ────────
+  status(`Consultando Scryfall para ${cardNames.length} cartas...`);
   const cardData = {};
-  const batchSize = 8;
-  for(let i=0; i<Math.min(cardNames.length, 60); i+=batchSize){
-    const batch = cardNames.slice(i, i+batchSize);
-    const q = batch.map(n=>`!"${n}"`).join(' OR ');
+  for(let i = 0; i < Math.min(cardNames.length, 80); i += 8){
+    const batch = cardNames.slice(i, i + 8);
+    const q = batch.map(n => `!"${n}"`).join(' OR ');
     const r = await sfQ(`(${q}) -is:extra`);
-    r.forEach(card => { cardData[card.name.toLowerCase()] = card; });
+    r.forEach(c => { cardData[c.name.toLowerCase()] = c; });
   }
 
-  // Detect commander from data if not marked — only consider cards in the first 20 lines to avoid
-  // picking up newly-added cards (which get appended at the end without *CMDR*)
+  // ── 3. Detectar comandante ──────────────────────────────────────────
+  let cmdName = cmdrFromTag;
   if(!cmdName){
-    const earlyNames = cardNames.slice(0, 20);
-    const legendary = earlyNames.find(n => {
+    // Buscar primera Legendary Creature en toda la lista (no solo 20 primeros)
+    cmdName = cardNames.find(n => {
       const d = cardData[n.toLowerCase()];
       return d && (d.type_line||'').includes('Legendary') && (d.type_line||'').includes('Creature');
-    });
-    if(legendary) cmdName = legendary;
+    }) || '';
+  }
+  // Si aún no hay comandante, intentar fuzzy: cualquier legendaria conocida
+  if(!cmdName){
+    cmdName = cardNames.find(n => {
+      const d = cardData[n.toLowerCase()];
+      return d && (d.type_line||'').includes('Legendary');
+    }) || '';
   }
 
-  // Get color identity from commander
   const cmdCard = cmdName ? cardData[cmdName.toLowerCase()] : null;
-  const ci = cmdCard?.color_identity || ['W','U','B','R','G'];
-  const colorStr = ci.join('');
+  const ci = cmdCard?.color_identity || [];
+  const colorStr = ci.join('') || 'WUBRG';
+  const idc = cmdCard
+    ? (ci.length ? `id<=${ci.join('')}` : 'id:colorless')
+    : 'id<=WUBRG';
 
-  resultEl.innerHTML=`<div class="ldc"><div class="spin-big"></div>Buscando mejoras en EDHREC para ${cmdName||'tu mazo'}...</div>`;
-
-  // Fetch EDHREC recommendations for this commander
+  // ── 4. Fetch EDHREC ─────────────────────────────────────────────────
+  status(`Buscando recomendaciones EDHREC para ${cmdName||'tu mazo'}...`);
   let edhRecs = [];
-  if(cmdName){
-    edhRecs = await fetchEdhrecForCommander(cmdName);
-  }
+  if(cmdName) edhRecs = await fetchEdhrecForCommander(cmdName);
 
-  // Find cards in EDHREC top list that aren't in the deck
-  const deckSet = new Set(cardNames.map(n=>n.toLowerCase()));
+  const deckSet = new Set(cardNames.map(n => n.toLowerCase()));
   const missing = edhRecs
     .filter(r => r.name && !deckSet.has(r.name.toLowerCase()))
-    .sort((a,b) => (b.num_decks||b.inclusion||0) - (a.num_decks||a.inclusion||0))
+    .sort((a,b) => (b.inclusion||b.num_decks||0) - (a.inclusion||a.num_decks||0))
     .slice(0, 30);
 
-  // Also find high-synergy staples not in deck
-  const cfColor = `color<=${colorStr} legal:commander -is:extra`;
-  const staplePool = await sfQ(`(o:"draw" o:"card" OR o:"search your library" OR o:"counter target" OR o:"destroy all") ${cfColor}`);
-  const missStaples = staplePool
-    .filter(c => !deckSet.has(c.name.toLowerCase()) && (c.edhrec_rank||9999) < 500)
-    .sort((a,b)=>(a.edhrec_rank||9999)-(b.edhrec_rank||9999))
-    .slice(0,20);
+  // ── 5. Staples por color ────────────────────────────────────────────
+  status('Buscando staples por identidad de color...');
+  let missStaples = [];
+  try {
+    const cfColor = `${idc} legal:commander -is:extra`;
+    const staplePool = await sfQ(
+      `(o:"draw a card" OR o:"search your library" OR o:"counter target" OR o:"destroy all") ${cfColor}`
+    );
+    missStaples = staplePool
+      .filter(c => !deckSet.has(c.name.toLowerCase()) && (c.edhrec_rank||9999) < 500)
+      .sort((a,b) => (a.edhrec_rank||9999) - (b.edhrec_rank||9999))
+      .slice(0, 20);
+  } catch(e) { console.warn('[Optimizer staples]', e); }
 
-  // Fetch images for missing cards
-  const allMissing = [...missing.slice(0,20)];
-  const missingImgs = {};
-  for(let i=0; i<allMissing.length; i+=8){
-    const batch = allMissing.slice(i,i+8);
-    const q = batch.map(c=>`!"${c.name}"`).join(' OR ');
-    const r = await sfQ(`(${q}) -is:extra`);
-    r.forEach(card => { missingImgs[card.name.toLowerCase()] = card; });
+  // ── 6. Si EDHREC vacío, usar Scryfall directamente como fallback ────
+  let allMissing = [...missing.slice(0, 20)];
+  if(allMissing.length === 0 && cmdName){
+    status('EDHREC sin datos — buscando con Scryfall...');
+    try {
+      const cfColor = `${idc} legal:commander -is:extra`;
+      const fallback = await sfQ(`${cfColor}`);
+      allMissing = fallback
+        .filter(c => !deckSet.has(c.name.toLowerCase()) && (c.edhrec_rank||9999) < 2000)
+        .sort((a,b) => (a.edhrec_rank||9999) - (b.edhrec_rank||9999))
+        .slice(0, 20)
+        .map(c => ({ name: c.name, num_decks: 0, inclusion: 0 }));
+    } catch(e) {}
   }
 
-  // Build AI analysis if API key available
+  // ── 7. Fetch imágenes para cartas que faltan ─────────────────────────
+  if(allMissing.length > 0){
+    status('Cargando imágenes...');
+  }
+  const missingImgs = {};
+  for(let i = 0; i < allMissing.length; i += 8){
+    const batch = allMissing.slice(i, i + 8);
+    const q = batch.map(c => `!"${c.name}"`).join(' OR ');
+    const r = await sfQ(`(${q}) -is:extra`);
+    r.forEach(c => { missingImgs[c.name.toLowerCase()] = c; });
+  }
+
+  // ── 8. Análisis IA ──────────────────────────────────────────────────
   let aiAnalysis = '';
   if(S.apiKey && cmdName){
-    const deckList = cardNames.slice(0,40).join(', ');
-    const topMissing = allMissing.slice(0,10).map(c=>c.name).join(', ');
-    try{
-      const res = await fetch('https://api.anthropic.com/v1/messages',{
-        method:'POST',
-        headers:{'Content-Type':'application/json','x-api-key':S.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:800,messages:[{role:'user',content:
-          `Experto MTG Commander. Analiza este mazo y sugiere mejoras específicas en español.
-Comandante: ${cmdName}
-Cartas actuales (muestra): ${deckList}
-Cartas recomendadas por EDHREC no incluidas: ${topMissing}
+    status('Generando análisis con Claude...');
+    const deckList  = cardNames.slice(0, 40).join(', ');
+    const topMissing = allMissing.slice(0, 10).map(c => c.name).join(', ');
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': S.apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true'
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-6',
+          max_tokens: 1200,
+          system: `Eres un Analista de Metajuego y Arquitecto de Combos para MTG Commander, calibrado para cEDH. Análisis clínico, nunca entusiasta. Vocabulario obligatorio: Fast Mana, Turno Crítico, Cuello de Botella, [ENGINE]/[ENABLER]/[PAYOFF]/[INTERACTION]/[TRAP], Threat Assessment, Ventana de Interacción. Prohibido: sugerir cartas genéricas sin especificar CMC + función + amenaza del meta que resuelven. Prohibido: confundir temática con sinergia. Prohibido: silencio sobre Cartas Trampa — identificarlas siempre es obligatorio. El nivel por defecto es cEDH; ajusta a casual solo si hay evidencia explícita.`,
+          messages: [{
+            role: 'user',
+            content: `Analiza este mazo de Commander con precisión técnica cEDH. Responde en español.
 
-En 3-4 párrafos breves:
-1. Debilidades principales del mazo actual
-2. Las 3-5 cartas más importantes que faltan y por qué
-3. Qué cartas del mazo actual podrían salir para hacerles hueco`}]})
+COMANDANTE: ${cmdName}
+CARTAS ACTUALES (muestra de ${deckList.split(',').length}): ${deckList}
+CARTAS RECOMENDADAS POR EDHREC QUE FALTAN: ${topMissing||'(sin datos EDHREC)'}
+
+## 1. DIAGNÓSTICO RÁPIDO
+Arquetipo probable (Turbo/Midrange/Control/Stax/Aggro-Tempo) · Turno Crítico objetivo estimado · Fortaleza estructural · Debilidad estructural principal.
+
+## 2. CUELLOS DE BOTELLA CRÍTICOS
+Lista numerada (máximo 3) ordenada por impacto. Para cada uno: qué falla, por qué falla en el contexto de este comandante concreto, y qué categoría [ENGINE/ENABLER/PAYOFF/INTERACTION] está infrarrepresentada o ausente.
+
+## 3. SWAPS PRIORITARIOS
+Para cada swap (máximo 5), formato estricto:
+OUT: [carta a sacar] — razón funcional concreta (CMC, table dependency, do-nothing permanent, etc.)
+IN: [carta de las recomendadas por EDHREC] — CMC, categoría [ENGINE/ENABLER/PAYOFF/INTERACTION], qué cuello de botella resuelve
+RAZÓN: impacto en el Turno Crítico o en la densidad de combo.`
+          }]
+        })
       });
-      if(res.ok){const d=await res.json();aiAnalysis=d.content?.[0]?.text||'';}
-    }catch(e){}
+      if(res.ok){
+        const d = await res.json();
+        aiAnalysis = d.content?.[0]?.text || '';
+      } else {
+        const err = await res.json().catch(()=>({}));
+        console.error('[Optimizer IA] HTTP', res.status, err);
+      }
+    } catch(e) { console.error('[Optimizer IA]', e); }
   }
 
-  // Render results
+  // ── 9. Estadísticas del mazo ────────────────────────────────────────
   const deckStats = {
-    total: cardNames.length,
-    creatures: cardNames.filter(n=>(cardData[n.toLowerCase()]?.type_line||'').includes('Creature')).length,
-    lands: cardNames.filter(n=>(cardData[n.toLowerCase()]?.type_line||'').includes('Land')).length,
-    cmd: cmdName,
-    colors: colorStr,
+    total:    cardNames.length,
+    creatures: cardNames.filter(n => (cardData[n.toLowerCase()]?.type_line||'').includes('Creature')).length,
+    lands:     cardNames.filter(n => (cardData[n.toLowerCase()]?.type_line||'').includes('Land')).length,
   };
 
-  resultEl.innerHTML=`
-    <!-- Stats -->
+  // ── 10. Render final ────────────────────────────────────────────────
+  resultEl.innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px">
       <div class="stat-box"><div class="stn">${deckStats.total}</div><div class="stl">cartas detectadas</div></div>
       <div class="stat-box"><div class="stn">${deckStats.creatures}</div><div class="stl">criaturas</div></div>
@@ -4652,32 +5197,51 @@ En 3-4 párrafos breves:
       <div class="stat-box"><div class="stn">${edhRecs.length}</div><div class="stl">datos EDHREC</div></div>
     </div>
 
-    ${cmdName?`<div class="info-banner">Comandante detectado: <strong>${cmdName}</strong> · Colores: <strong>${colorStr||'Sin color'}</strong></div>`:'<div class="info-banner">⚠ No se detectó comandante. Márcalo con *CMDR* en la lista para mejores resultados.</div>'}
+    ${cmdName
+      ? `<div class="info-banner">Comandante detectado: <strong>${cmdName}</strong> · Colores: <strong>${colorStr}</strong></div>`
+      : `<div class="info-banner" style="border-color:rgba(224,85,85,.4);background:rgba(224,85,85,.08)">⚠ No se detectó comandante automáticamente. Añade <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">*CMDR*</code> al final del nombre en la lista para mejores resultados.</div>`
+    }
 
-    ${aiAnalysis?`
+    ${aiAnalysis ? `
     <div class="strategy-analysis" style="margin-bottom:16px">
       <div class="sa-title">🤖 Análisis IA del mazo</div>
-      <div class="sa-body" style="display:block">${aiAnalysis.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/^## (.+)$/gm,'<div style="font-size:13px;font-weight:700;color:var(--gold);margin:12px 0 4px">$1</div>').replace(/\*\*(.+?)\*\*/g,'<strong style="color:var(--text)">$1</strong>').replace(/\n/g,'<br>')}</div>
-    </div>`:''}
+      <div class="sa-body" style="display:block">${
+        aiAnalysis
+          .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/^## (.+)$/gm,'<div style="font-size:13px;font-weight:700;color:var(--gold);margin:12px 0 4px">$1</div>')
+          .replace(/^OUT: (.+)$/gm,'<div style="margin:6px 0;padding:6px 10px;background:rgba(224,85,85,.08);border-left:3px solid var(--red);border-radius:4px;font-size:12px"><span style="color:var(--red);font-weight:700">OUT:</span> $1</div>')
+          .replace(/^IN: (.+)$/gm,'<div style="margin:2px 0 6px;padding:6px 10px;background:rgba(76,175,125,.08);border-left:3px solid var(--green);border-radius:4px;font-size:12px"><span style="color:var(--green);font-weight:700">IN:</span> $1</div>')
+          .replace(/^RAZÓN: (.+)$/gm,'<div style="margin:-2px 0 10px 10px;font-size:11px;color:var(--text2);font-style:italic">↳ $1</div>')
+          .replace(/\*\*(.+?)\*\*/g,'<strong style="color:var(--text)">$1</strong>')
+          .replace(/\[ENGINE\]/g,'<span style="background:rgba(74,158,221,.2);color:#4a9edd;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700">[ENGINE]</span>')
+          .replace(/\[ENABLER\]/g,'<span style="background:rgba(212,168,67,.2);color:var(--gold);padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700">[ENABLER]</span>')
+          .replace(/\[PAYOFF\]/g,'<span style="background:rgba(76,175,125,.2);color:var(--green);padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700">[PAYOFF]</span>')
+          .replace(/\[INTERACTION\]/g,'<span style="background:rgba(124,92,191,.2);color:var(--accent2);padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700">[INTERACTION]</span>')
+          .replace(/\[TRAP\]/g,'<span style="background:rgba(224,85,85,.2);color:var(--red);padding:1px 5px;border-radius:3px;font-size:10px;font-weight:700">[TRAP]</span>')
+          .replace(/\n/g,'<br>')
+      }</div>
+    </div>` : ''}
 
-    <!-- Cartas recomendadas de EDHREC que faltan -->
-    ${allMissing.length?`
+    ${allMissing.length ? `
     <div class="must-panel">
       <div class="must-title">⭐ Cartas recomendadas por EDHREC que no tienes</div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Pasa el ratón sobre una carta para ver qué hace · Haz clic en + para sugerir el swap</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:12px">Pasa el ratón para ver qué hace la carta · Haz clic en + para sugerir el swap</div>
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px" id="opt-missing-grid">
-        ${allMissing.slice(0,24).map(item=>{
+        ${allMissing.slice(0,24).map(item => {
           const card = missingImgs[item.name?.toLowerCase()];
-          const img = card?.image_uris?.normal||card?.card_faces?.[0]?.image_uris?.normal||'';
-          const pct = item.inclusion?item.inclusion+'%':item.num_decks?(item.num_decks/1000).toFixed(1)+'k mazos':'';
+          const img = card?.image_uris?.normal || card?.card_faces?.[0]?.image_uris?.normal || '';
+          const pct = item.inclusion ? item.inclusion+'%' : item.num_decks ? (item.num_decks/1000).toFixed(1)+'k' : '';
           const safeId = (item.name||'').replace(/[^a-z0-9]/gi,'_');
-          const oracle = card?.oracle_text||card?.card_faces?.[0]?.oracle_text||'';
+          const oracle = card?.oracle_text || card?.card_faces?.[0]?.oracle_text || '';
           return `<div class="must-card" id="optcard-${safeId}" style="position:relative"
             data-name="${(item.name||'').replace(/"/g,'&quot;')}"
             data-img="${img}"
             data-oracle="${oracle.replace(/"/g,'&quot;').replace(/\n/g,' ')}">
             <div class="ess-add-btn" onclick="addOptCard('${(item.name||'').replace(/'/g,"\\'")}','${safeId}')" title="Sugerir swap">+</div>
-            ${img?`<img src="${img}" alt="${item.name}" loading="lazy">`:'<div style="aspect-ratio:5/7;background:var(--bg3);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:28px">🃏</div>'}
+            ${img
+              ? `<img src="${img}" alt="${item.name}" loading="lazy">`
+              : `<div style="aspect-ratio:5/7;background:var(--bg3);border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:28px">🃏</div>`
+            }
             <div class="mc-info">
               <div class="mc-name">${item.name}</div>
               <div class="mc-pct">${pct}</div>
@@ -4685,37 +5249,37 @@ En 3-4 párrafos breves:
           </div>`;
         }).join('')}
       </div>
-    </div>`:''}
+    </div>` : `<div class="info-banner" style="margin-top:12px">ℹ EDHREC no devolvió recomendaciones para este comandante. Esto puede ocurrir con comandantes nuevos o poco jugados.</div>`}
 
-    <!-- Staples que faltan -->
-    ${missStaples.length?`
+    ${missStaples.length ? `
     <div class="must-panel" style="margin-top:14px">
       <div class="must-title">🔮 Staples de Commander que no tienes</div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:10px">Cartas con EDHREC rank &lt; 500 en tus colores · pasa el ratón para ver qué hacen</div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:10px">Cartas con EDHREC rank &lt; 500 en tus colores</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
-        ${missStaples.map(c=>`<span style="background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rsm);padding:4px 10px;font-size:11px;color:var(--text2);cursor:pointer"
+        ${missStaples.map(c => `<span style="background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rsm);padding:4px 10px;font-size:11px;color:var(--text2);cursor:pointer"
           onmouseenter="showZByName(event,'${c.name.replace(/'/g,"\\'")}','')" onmouseleave="hideZ()">
           ${c.name} <span style="color:var(--text3)">#${c.edhrec_rank}</span>
         </span>`).join('')}
       </div>
-    </div>`:''}
+    </div>` : ''}
 
     <div style="margin-top:16px;display:flex;gap:8px">
       <button class="btn btn-g btn-sm" onclick="renderOptimize()">← Nueva lista</button>
       <button class="btn btn-g btn-sm" onclick="goPanel('home');renderHome()">🏠 Inicio</button>
     </div>`;
 
-  // Attach zoom events to optimizer cards (needs to be done after innerHTML is set)
-  setTimeout(()=>{
-    document.querySelectorAll('#opt-missing-grid .must-card').forEach(el=>{
-      const name = el.dataset.name;
-      const img = el.dataset.img;
+  // Attach zoom events to optimizer cards
+  setTimeout(() => {
+    document.querySelectorAll('#opt-missing-grid .must-card').forEach(el => {
+      const name   = el.dataset.name;
+      const img    = el.dataset.img;
       const oracle = el.dataset.oracle;
       el.addEventListener('mouseenter', e => showZ(e, img, name, oracle));
       el.addEventListener('mouseleave', hideZ);
     });
   }, 50);
 }
+
 
 async function addOptCard(name, safeId){
   // Mark the card as "processing"
@@ -4877,11 +5441,16 @@ async function addOptCard(name, safeId){
       const res = await fetch('https://api.anthropic.com/v1/messages',{
         method:'POST',
         headers:{'Content-Type':'application/json','x-api-key':S.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-        body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:200,messages:[{role:'user',content:
-          `MTG Commander experto. Explica en 2-3 frases directas en español por qué "${weakest.name}" es la carta de menor sinergia en un mazo de ${cmdName||'Commander'} con esta estrategia.
-Texto de oráculo de la carta: ${weakest.card?.oracle_text||'sin texto'}
+        body:JSON.stringify({model:'claude-haiku-4-5',max_tokens:250,
+          system:`Eres un Analista de Metajuego MTG Commander calibrado para cEDH. Análisis clínico, nunca entusiasta. Usas terminología técnica: CMC, Table Dependency, Do-Nothing Permanent, Cuello de Botella, [ENGINE]/[ENABLER]/[PAYOFF]/[INTERACTION]/[TRAP], Ventana de Interacción.`,
+          messages:[{role:'user',content:
+          `En 2-3 frases directas en español, diagnostica por qué "${weakest.name}" es la carta de menor sinergia en este mazo de ${cmdName||'Commander'}.
+
+Texto de oráculo: ${weakest.card?.oracle_text||'sin texto'}
+CMC: ${weakest.card?.cmc||'?'}
 EDHREC rank: ${weakest.card?.edhrec_rank||'sin datos'}
-Di concretamente por qué no encaja: si es situacional, si no genera valor continuo, si no interactúa con el comandante, etc.`}]})
+
+Clasifica la carta como [ENGINE]/[ENABLER]/[PAYOFF]/[INTERACTION]/[TRAP] y justifica en qué falla: ¿CMC prohibitivo para el Turno Crítico del mazo? ¿Table Dependency? ¿Do-Nothing Permanent? ¿No interactúa con el plan de victoria del comandante? Sé específico, no genérico.`}]})
       });
       if(res.ok){
         const d=await res.json();
@@ -5000,7 +5569,7 @@ async function aiAnalysis(card,strat,bracket,partner){
     const res=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',
       headers:{'Content-Type':'application/json','x-api-key':S.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model:'claude-haiku-4-5-20251001',max_tokens:110,messages:[{role:'user',content:`MTG Commander experto. 2 frases directas: ${desc}\nEstrategia: ${strat.name}, Bracket ${bracket} (${bdata.name}). ¿Encaja? ¿Combos?`}]})
+      body:JSON.stringify({model:'claude-haiku-4-5',max_tokens:110,messages:[{role:'user',content:`MTG Commander experto. 2 frases directas: ${desc}\nEstrategia: ${strat.name}, Bracket ${bracket} (${bdata.name}). ¿Encaja? ¿Combos?`}]})
     });
     if(!res.ok) return null;
     const d=await res.json(); return d.content?.[0]?.text||null;
@@ -5257,7 +5826,8 @@ async function addMustCard(cardName) {
 // ═══════════════════════════════════════════════════════════
 async function loadCombos(deck) {
   const ci = S._ci || [];
-  const colorStr = ci.join('') || 'WUBRG';
+  // Incoloro → 'C' (Commander Spellbook usa C para identidad incolora), no WUBRG.
+  const colorStr = ci.length ? ci.join('') : 'C';
   const loadEl = document.getElementById('combo-loading');
   const listEl = document.getElementById('combo-list');
   if (!loadEl || !listEl) return;
